@@ -1,0 +1,86 @@
+name: Update Courses JSON
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-courses-json
+  cancel-in-progress: false
+
+jobs:
+  update-json:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout scraper repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper (create master_courses.json)
+        env:
+          BATCHES_URL: ${{ secrets.BATCHES_URL }}
+          API_BASE: ${{ secrets.API_BASE }}
+          KEYWORDS: ${{ secrets.KEYWORDS }}
+          REFERER: ${{ secrets.REFERER }}
+          ORIGIN: ${{ secrets.ORIGIN }}
+          THREADS: "3"
+          MAX_RETRIES: "5"
+          REQUEST_TIMEOUT: "25"
+          BACKOFF_BASE: "0.8"
+          BACKOFF_CAP: "10"
+          REQUEST_JITTER: "0.15"
+        run: python script.py
+
+      - name: Debug files
+        run: |
+          echo "Workspace files:"
+          ls -lah
+          echo "Preview master_courses.json (first 30 lines):"
+          if [ -f master_courses.json ]; then head -n 30 master_courses.json; fi
+
+      - name: Push JSON to private repo (myusername/k -> k/master_course_new.json)
+        env:
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          set -e
+
+          if [ -f SKIP_PUSH ]; then
+            echo "Global outage detected — skipping push."
+            exit 0
+          fi
+
+          if [ ! -s master_courses.json ]; then
+            echo "master_courses.json missing or empty — skipping push."
+            exit 0
+          fi
+
+          git config --global user.name "Automated"
+          git config --global user.email "actions@users.noreply.github.com"
+
+          git clone "https://x-access-token:${PUSH_TOKEN}@github.com/${PRIVATE_REPO}.git" private-data
+
+          # ensure folder exists inside private repo
+          mkdir -p private-data/k
+
+          # copy JSON to target path in private repo
+          cp master_courses.json private-data/k/master_course_new.json
+
+          cd private-data
+          git add k/master_course_new.json
+          git commit -m "Update master_course_new.json: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || exit 0
+          git push
