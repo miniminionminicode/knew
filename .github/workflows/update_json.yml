@@ -35,10 +35,15 @@ jobs:
           BATCHES_URL: ${{ secrets.BATCHES_URL }}
           API_BASE: ${{ secrets.API_BASE }}
 
-          # NEW: handshake protocol (hidden)
+          # Handshake protocol (Replaces hardcoded auth headers)
           HANDSHAKE_URL: ${{ secrets.HANDSHAKE_URL }}
           HANDSHAKE_HEADER_NAME: ${{ secrets.HANDSHAKE_HEADER_NAME }}
           HANDSHAKE_HEADER_VALUE: ${{ secrets.HANDSHAKE_HEADER_VALUE }}
+
+          # New Verification Endpoints & Manual Fallback Cookie
+          STATUS_URL: ${{ secrets.STATUS_URL }}
+          GENERATE_LINK_URL: ${{ secrets.GENERATE_LINK_URL }}
+          SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
 
           KEYWORDS: ${{ secrets.KEYWORDS }}
           REFERER: ${{ secrets.REFERER }}
