@@ -16,6 +16,7 @@ BATCHES_URL = os.getenv("BATCHES_URL")
 API_BASE = os.getenv("API_BASE")              
 HANDSHAKE_URL = os.getenv("HANDSHAKE_URL")      
 HANDSHAKE_HEADER_VALUE = os.getenv("HANDSHAKE_HEADER_VALUE")
+HANDSHAKE_HEADER_NAME = os.getenv("HANDSHAKE_HEADER_NAME")
 if not BATCHES_URL:
     raise RuntimeError("Missing BATCHES_URL secret")
 if not API_BASE:
