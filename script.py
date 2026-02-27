@@ -12,17 +12,22 @@ import threading
 # ---------------------------
 # ENV CONFIG (production)
 # ---------------------------
-BATCHES_URL = os.getenv("BATCHES_URL")        
+BATCHES_URL = os.getenv("BATCHES_URL")     
 API_BASE = os.getenv("API_BASE")              
-HANDSHAKE_URL = os.getenv("HANDSHAKE_URL")      
+HANDSHAKE_URL = os.getenv("HANDSHAKE_URL")   
+HANDSHAKE_HEADER_NAME = os.getenv("HANDSHAKE_HEADER_NAME")   
 HANDSHAKE_HEADER_VALUE = os.getenv("HANDSHAKE_HEADER_VALUE")
-HANDSHAKE_HEADER_NAME = os.getenv("HANDSHAKE_HEADER_NAME")
+
 if not BATCHES_URL:
     raise RuntimeError("Missing BATCHES_URL secret")
 if not API_BASE:
     raise RuntimeError("Missing API_BASE secret")
 if not HANDSHAKE_URL:
     raise RuntimeError("Missing HANDSHAKE_URL secret")
+if not HANDSHAKE_HEADER_NAME:
+    raise RuntimeError("Missing HANDSHAKE_HEADER_NAME secret")
+if not HANDSHAKE_HEADER_VALUE:
+    raise RuntimeError("Missing HANDSHAKE_HEADER_VALUE secret")
 
 _keywords_env = os.getenv("KEYWORDS")
 if not _keywords_env:
@@ -43,12 +48,21 @@ BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "0.8"))
 BACKOFF_CAP = float(os.getenv("BACKOFF_CAP", "10"))
 REQUEST_JITTER = float(os.getenv("REQUEST_JITTER", "0.15"))
 
-# Keep your variable names clean; only the header/cookie protocol uses that value.
+# Handshake validity is ~8 seconds. Use "8-2" margin => 6 seconds default.
+HANDSHAKE_VALIDITY_SEC = float(os.getenv("HANDSHAKE_VALIDITY_SEC", "6"))
+
+DEBUG = os.getenv("DEBUG", "1") == "1"
+
+def log(msg: str):
+    if DEBUG:
+        tname = threading.current_thread().name
+        print(f"[{tname}] {msg}", flush=True)
+
 HEADERS = {
     "Referer": REFERER,
     "Origin": ORIGIN,
     "Accept": "*/*",
-    HANDSHAKE_HEADER_NAME: HANDSHAKE_HEADER_VALUE,
+    HANDSHAKE_HEADER_NAME: HANDSHAKE_HEADER_VALUE,  # header name & value both hidden via secrets
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -56,22 +70,21 @@ HEADERS = {
     ),
 }
 
-# --------------------------
+# ---------------------------
 # Thread-local session (important for multi-thread stability)
 # ---------------------------
 _thread_local = threading.local()
 
 def get_session() -> requests.Session:
     """
-    Each worker thread gets its own session + cookies,
-    preventing cookie races across threads.
+    Each worker thread gets its own session + cookies.
+    This prevents cookie races across threads.
     """
     s = getattr(_thread_local, "session", None)
     if s is None:
         s = requests.Session()
         _thread_local.session = s
     return s
-
 
 # ---------------------------
 # Helpers
@@ -83,88 +96,109 @@ def ensure_list(x):
         return [x]
     return []
 
-
-def to_api_path(url: str) -> str | None:
+def to_api_path(url: str):
     """
-    Convert a full API URL to the /api/... path needed by handshake endpoint.
-    Example:
-      API_BASE = https://kgs-web.vercel.app/api
-      url      = https://kgs-web.vercel.app/api/classroom/848
-      -> /api/classroom/848
+    Convert full API URL to /api/... path needed by handshake.
+    API_BASE must include '/api' at the end, e.g. https://host/api
     """
     if not isinstance(url, str):
         return None
     if not url.startswith(API_BASE):
         return None
-    suffix = url[len(API_BASE):]  # includes leading "/" like "/classroom/848"
+    suffix = url[len(API_BASE):]  # e.g. "/classroom/848"
     return "/api" + suffix
 
-
-def prime_handshake(session: requests.Session, api_path: str, method: str = "GET") -> bool:
+def prime_handshake(session: requests.Session, api_path: str, method: str = "GET") -> tuple[bool, float]:
     """
-    Call handshake endpoint to set cookies for the next real API request.
-    api_path MUST look like /api/... (dynamic, derived from the URL).
+    Calls handshake endpoint to set short-lived cookies.
+    Returns (ok, timestamp_when_done).
     """
     try:
-        # Example:
-        # HANDSHAKE_URL = https://kgs-web.vercel.app/api/sunny-keys
-        # -> https://.../sunny-keys?path=/api/classroom/848&method=GET
         url = f"{HANDSHAKE_URL}?path={quote(api_path, safe='/:?=&')}&method={method}"
         r = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        return r.status_code == 200
-    except requests.RequestException:
-        return False
-
+        ts = time.time()
+        if r.status_code == 200:
+            log(f"[HS OK] {api_path}")
+            return True, ts
+        log(f"[HS FAIL] {api_path} status={r.status_code}")
+        return False, ts
+    except requests.RequestException as e:
+        ts = time.time()
+        log(f"[HS ERROR] {api_path} err={e}")
+        return False, ts
 
 def safe_get(url: str):
     """
-    Robust GET with retries + handshake priming.
+    Robust GET with retries + handshake before EVERY request.
+    IMPORTANT: We do all sleeps BEFORE handshake so the real request always
+    happens immediately after handshake (within HANDSHAKE_VALIDITY_SEC window).
     Returns: (json_data_or_None, ok_bool)
     """
     api_path = to_api_path(url)
 
     for attempt in range(1, MAX_RETRIES + 1):
+        # Any delays happen BEFORE handshake (so handshake -> request stays tight)
         if REQUEST_JITTER > 0:
             time.sleep(random.uniform(0, REQUEST_JITTER))
 
         session = get_session()
 
-        # Prime cookies immediately before real request (no artificial long sleep).
+        hs_ok = True
+        hs_ts = 0.0
         if api_path:
-            prime_handshake(session, api_path, "GET")
+            hs_ok, hs_ts = prime_handshake(session, api_path, "GET")
 
+        # No sleeps or extra work here — request must be immediately after handshake
         try:
             r = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
             code = r.status_code
 
-            # transient server errors
+            # We log AFTER the request (logging does not affect handshake validity)
+            if api_path:
+                age = time.time() - hs_ts
+                log(f"[REQ] {code} {url} (try {attempt}) hs_ok={hs_ok} hs_age={age:.2f}s")
+                if age > HANDSHAKE_VALIDITY_SEC:
+                    log(f"[WARN] Handshake-to-request age {age:.2f}s exceeded {HANDSHAKE_VALIDITY_SEC:.2f}s")
+            else:
+                log(f"[REQ] {code} {url} (try {attempt}) (no-handshake)")
+
+            # retry on common transient server errors
             if code in (500, 502, 503, 504):
-                wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
                 if attempt < MAX_RETRIES:
+                    wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
+                    log(f"[RETRY SERVER] wait={wait:.2f}s")
                     time.sleep(wait)
                     continue
                 return None, False
 
-            # other non-200 errors: retry a few times because handshake cookies may expire quickly
-            if code != 200:
-                wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
+            # retry on auth-like failures too (cookies can be picky)
+            if code in (401, 403):
                 if attempt < MAX_RETRIES:
+                    wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
+                    log(f"[RETRY AUTH] wait={wait:.2f}s")
                     time.sleep(wait)
                     continue
+                return None, False
+
+            if code != 200:
                 return None, False
 
             try:
                 return r.json(), True
             except Exception:
+                log(f"[JSON FAIL] {url}")
                 return None, False
 
-        except requests.RequestException:
-            wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
+        except requests.RequestException as e:
+            log(f"[REQ ERROR] {url} err={e}")
             if attempt < MAX_RETRIES:
+                wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
                 time.sleep(wait)
                 continue
             return None, False
 
+    log(f"[FAILED AFTER RETRIES] {url}")
+    return None, False
 
 def load_master_json():
     try:
@@ -181,22 +215,18 @@ def load_master_json():
     except Exception as e:
         raise RuntimeError(f"Failed to read {MASTER_JSON_FILE}: {e}")
 
-
 def save_master_json(data):
     tmp = MASTER_JSON_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, MASTER_JSON_FILE)
 
-
 def is_blank(x):
     return x in (None, "", [], {})
-
 
 def merge_scalar_fill_only(existing_dict, k, new_val):
     if is_blank(existing_dict.get(k)) and not is_blank(new_val):
         existing_dict[k] = new_val
-
 
 def merge_dict_fill_only(existing, new):
     for k, v in (new or {}).items():
@@ -209,7 +239,6 @@ def merge_dict_fill_only(existing, new):
                 existing[k] = []
         else:
             merge_scalar_fill_only(existing, k, v)
-
 
 def merge_list_by_key(existing_list, new_list, key="id"):
     if not isinstance(existing_list, list):
@@ -245,7 +274,6 @@ def merge_list_by_key(existing_list, new_list, key="id"):
 
     return existing_list
 
-
 def fingerprint(item):
     if not isinstance(item, dict):
         return str(item)
@@ -256,7 +284,6 @@ def fingerprint(item):
     ts = item.get("published_at") or item.get("publishedAt") or item.get("created_at") or item.get("createdAt") or ""
     body = item.get("content") or item.get("message") or item.get("description") or ""
     return f"{ts}|{hash(body)}"
-
 
 def merge_list_by_fingerprint(existing_list, new_list):
     if not isinstance(existing_list, list):
@@ -276,7 +303,6 @@ def merge_list_by_fingerprint(existing_list, new_list):
             idx[fp] = len(existing_list) - 1
 
     return existing_list
-
 
 def merge_course(existing_course, new_course):
     merge_dict_fill_only(existing_course, {k: v for k, v in new_course.items() if k != "_ok"})
@@ -349,7 +375,6 @@ def merge_course(existing_course, new_course):
             new_course.get("announcements", [])
         )
 
-
 def upsert_course(master_json, course_id, new_course):
     course_id = str(course_id)
     for c in master_json:
@@ -358,20 +383,17 @@ def upsert_course(master_json, course_id, new_course):
             return
     master_json.append(new_course)
 
-
 # ---------------------------
 # Keyword filtering
 # ---------------------------
 keyword_patterns = []
 for kw in KEYWORDS:
-    # Supports patterns like: "72 bpsc" -> match 72 bpsc, 72nd bpsc, 72xx bpsc
     m = re.match(r"(\d+)\s+(.*)", kw)
     if m:
         n, w = m.groups()
         keyword_patterns.append(re.compile(rf"\b{n}(?:st|nd|rd|th)?\d*\s*{re.escape(w)}\b", re.I))
     else:
         keyword_patterns.append(re.compile(rf"\b{re.escape(kw)}\b", re.I))
-
 
 # ---------------------------
 # Fetch course details (API)
@@ -390,17 +412,14 @@ def fetch_course_details(course, rank, total):
         "end_at": course.get("end_at"),
         "image_large": course.get("image_large"),
         "image_thumb": course.get("image_thumb"),
-
         "classroom": [],
         "lessons": [],
         "announcements": [],
         "lesson_count": 0,
-
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "_ok": {"classroom": False, "updates": False},
     }
 
-    # classroom endpoint returns {"classroom":[...]}
     classroom_data, classroom_ok = safe_get(f"{API_BASE}/classroom/{cid}")
     out["_ok"]["classroom"] = bool(classroom_ok)
 
@@ -417,6 +436,7 @@ def fetch_course_details(course, rank, total):
 
             lesson_data, lesson_ok = safe_get(f"{API_BASE}/lesson/{lesson_id}")
             if not lesson_ok or not isinstance(lesson_data, dict):
+                log(f"[LESSON FAIL] course_id={cid} lesson_id={lesson_id}")
                 continue
 
             # videos
@@ -443,7 +463,7 @@ def fetch_course_details(course, rank, total):
                     "video_pdfs": vd.get("pdfs", None) if vd_ok else None,
                 })
 
-            # notes/uploads/tests (also resolved through /video/{id})
+            # notes/uploads/tests
             notes_out = []
             for n in ensure_list(lesson_data.get("notes")):
                 if not isinstance(n, dict):
@@ -477,7 +497,6 @@ def fetch_course_details(course, rank, total):
                 "notes": notes_out,
             })
 
-    # updates endpoint returns list
     updates_data, updates_ok = safe_get(f"{API_BASE}/updates/{cid}")
     out["_ok"]["updates"] = bool(updates_ok)
     if updates_ok:
@@ -492,19 +511,18 @@ def fetch_course_details(course, rank, total):
     )
     return out
 
-
 def main():
     print("Fetching batches list...", flush=True)
 
-    # BATCHES_URL may be on a different host (GitHub pages). It usually doesn't need handshake.
-    # We'll fetch it with a plain one-off session for safety.
+    # Batches list likely does not need handshake
     try:
         r = requests.get(BATCHES_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             raise RuntimeError(f"batches status={r.status_code}")
         batches_data = r.json()
         batches_ok = True
-    except Exception:
+    except Exception as e:
+        log(f"[BATCHES FAIL] err={e}")
         batches_data, batches_ok = None, False
 
     batches = ensure_list(batches_data)
@@ -515,7 +533,6 @@ def main():
         print("batches_fetch_failed_skip", flush=True)
         raise SystemExit(0)
 
-    # Filter courses
     filtered_courses = []
     for item in batches:
         if not isinstance(item, dict):
@@ -542,7 +559,6 @@ def main():
         for f in as_completed(futures):
             results.append(f.result())
 
-    # Global outage logic (skip saving/pushing if EVERYTHING failed)
     any_ok_anywhere = any(
         r.get("_ok", {}).get("classroom") or r.get("_ok", {}).get("updates")
         for r in results
@@ -553,20 +569,17 @@ def main():
         print("global_outage_skip_save", flush=True)
         raise SystemExit(0)
 
-    # Merge results
     for r in results:
         cid = r.get("course_id")
         if cid:
             upsert_course(master_json, cid, r)
 
-    # Cleanup internal keys
     for c in master_json:
         if isinstance(c, dict):
             c.pop("_ok", None)
 
     save_master_json(master_json)
     print("done", flush=True)
-
 
 if __name__ == "__main__":
     main()
